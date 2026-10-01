@@ -1,0 +1,16 @@
+[Unit]
+Description=Realtek RTL8821CE Bluetooth fix (patched btusb 13d3:3558 + Windows RTL8821C firmware)
+Wants=network-online.target
+After=network-online.target systemd-modules-load.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/airpods-bt-fix
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=multi-user.target

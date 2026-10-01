@@ -1,0 +1,127 @@
+#!/bin/bash
+# airpods-bt-fix — Realtek RTL8821CE Bluetooth fix for Bazzite / Fedora Atomic
+#  1. Puts the RTL8821C firmware from Realtek's current Windows driver into /var/lib/airpods-bt/fw
+#     (the firmware in linux-firmware dates from 2022 and fails encryption with AirPods Pro 3).
+#  2. For the IMC Networks 13d3:3558 adapter, builds and loads btusb with the device ID added,
+#     until the upstream patch (bluetooth-next 809a66378e9e) reaches the Bazzite kernel.
+# The module is rebuilt automatically after every kernel update.
+#
+# Usage: airpods-bt-fix            (run by airpods-bt-fix.service at boot)
+#        airpods-bt-fix --prepare  (download firmware and build module only, do not touch the driver)
+set -uo pipefail
+
+DIR=/var/lib/airpods-bt
+FW="$DIR/fw/rtl_bt/rtl8821c_fw.bin"
+FW_SHA256=bbbebbc49ca86e99b0767a5aca6ac2e4f6c89643b2d8293c06521fa659e9856b
+# Realtek Bluetooth driver 16.4033.2312.2503 from the Microsoft Update Catalog (lists USB\VID_13D3&PID_3558)
+CAB_URL="https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/2026/03/9f0faf1e-7a5b-4099-b24e-c67e3f408193_314ea49471b292bd25afc9091ee0bf31f261dd78.cab"
+KVER=$(uname -r)
+KO="$DIR/btusb-$KVER.ko"
+FEDORA=$(rpm -E %fedora)
+IMG="localhost/airpods-bt-builder:f$FEDORA"
+
+log() { echo "airpods-bt-fix: $*"; }
+
+has_adapter() {
+  local d
+  for d in /sys/bus/usb/devices/*; do
+    [ "$(cat "$d/idVendor" 2>/dev/null)" = 13d3 ] && [ "$(cat "$d/idProduct" 2>/dev/null)" = 3558 ] && return 0
+  done
+  return 1
+}
+
+kernel_knows_adapter() { modinfo btusb 2>/dev/null | grep -qi 'v13D3p3558'; }
+
+builder() {
+  if ! podman image exists "$IMG"; then
+    log "creating build container $IMG (one-time, a few minutes)"
+    mkdir -p "$DIR/builder"
+    cat > "$DIR/builder/Containerfile" <<CF
+FROM registry.fedoraproject.org/fedora:$FEDORA
+RUN dnf install -y gcc make flex bison bc elfutils-libelf-devel openssl-devel curl cabextract findutils diffutils && dnf clean all
+CF
+    podman build -t "$IMG" "$DIR/builder" || return 1
+  fi
+  podman run --rm --network=host --security-opt label=disable \
+    -e KVER="$KVER" -e CAB_URL="$CAB_URL" \
+    -v "$DIR:/out" -v /usr/src/kernels:/kernels:ro \
+    "$IMG" bash -euo pipefail -c "$1"
+}
+
+fw_ok() { [ -f "$FW" ] && echo "$FW_SHA256  $FW" | sha256sum -c --quiet >/dev/null 2>&1; }
+
+get_firmware() {
+  fw_ok && return 0
+  log "downloading Realtek Windows driver and extracting RTL8821C firmware"
+  builder '
+    cd /tmp
+    curl -fsSL -o drv.cab "$CAB_URL"
+    cabextract -q drv.cab 2>/dev/null || true
+    f=$(find . -maxdepth 1 -iname "rtl8821c_mp_chip*.dat" | head -1)
+    [ -n "$f" ] || { echo "rtl8821c firmware not found in cab"; exit 1; }
+    mkdir -p /out/fw/rtl_bt
+    cp "$f" /out/fw/rtl_bt/rtl8821c_fw.bin
+  ' || { log "firmware download failed"; return 1; }
+  fw_ok || { log "firmware checksum mismatch, removing"; rm -f "$FW"; return 1; }
+  log "firmware installed: $FW"
+}
+
+build_module() {
+  [ -f "$KO" ] && return 0
+  [ -d "/usr/src/kernels/$KVER" ] || { log "no kernel headers in /usr/src/kernels/$KVER"; return 1; }
+  log "building patched btusb for $KVER"
+  builder '
+    V=${KVER%%-*}; V=${V%.0}
+    mkdir -p /tmp/b && cd /tmp/b
+    B="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/bluetooth"
+    curl -fsSL "$B/btusb.c?h=v$V" -o btusb.c
+    for h in $(grep -oP "#include \"\K[^\"]+" btusb.c); do curl -fsSL "$B/$h?h=v$V" -o "$h"; done
+    if ! grep -q "0x3558" btusb.c; then
+      sed -i "/Realtek 8821CE Bluetooth devices/a\\	{ USB_DEVICE(0x13d3, 0x3558), .driver_info = BTUSB_REALTEK | BTUSB_WIDEBAND_SPEECH }," btusb.c
+      grep -q "0x3558" btusb.c || { echo "patch failed"; exit 1; }
+    fi
+    echo "obj-m := btusb.o" > Makefile
+    make -s -C "/kernels/$KVER" M=/tmp/b modules
+    cp btusb.ko "/out/btusb-$KVER.ko"
+  ' || { log "module build failed"; rm -f "$KO"; return 1; }
+  # drop modules built for kernels that are no longer installed
+  local f k
+  for f in "$DIR"/btusb-*.ko; do
+    k=${f#"$DIR"/btusb-}; k=${k%.ko}
+    [ -d "/usr/lib/modules/$k" ] || rm -f "$f"
+  done
+  log "module built: $KO"
+}
+
+load_module() {
+  local want
+  want=$(modinfo -F srcversion "$KO")
+  for _ in $(seq 1 20); do
+    if grep -q '^btusb ' /proc/modules; then
+      [ "$(cat /sys/module/btusb/srcversion 2>/dev/null)" = "$want" ] && { log "patched btusb already loaded"; return 0; }
+      rmmod btusb && break
+    fi
+    sleep 0.5
+  done
+  insmod "$KO" || { log "insmod failed"; return 1; }
+  log "patched btusb loaded"
+  systemctl try-restart bluetooth.service || true
+}
+
+mkdir -p "$DIR"
+echo -n "$DIR/fw" > /sys/module/firmware_class/parameters/path 2>/dev/null || true
+rc=0
+get_firmware || rc=1
+
+if ! has_adapter; then
+  log "adapter 13d3:3558 not present — only the firmware is used"
+  exit $rc
+fi
+if kernel_knows_adapter; then
+  log "kernel $KVER already supports 13d3:3558 — stock btusb is used"
+  exit $rc
+fi
+build_module || exit 1
+[ "${1:-}" = "--prepare" ] && exit $rc
+load_module || exit 1
+exit $rc
