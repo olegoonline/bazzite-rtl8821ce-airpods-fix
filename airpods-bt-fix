@@ -93,8 +93,14 @@ build_module() {
   log "module built: $KO"
 }
 
+label_module() {
+  # SELinux only lets system services load files labelled as kernel modules
+  command -v chcon >/dev/null && chcon -t modules_object_t "$KO" 2>/dev/null || true
+}
+
 load_module() {
   local want
+  label_module
   want=$(modinfo -F srcversion "$KO")
   for _ in $(seq 1 20); do
     if grep -q '^btusb ' /proc/modules; then
@@ -103,7 +109,11 @@ load_module() {
     fi
     sleep 0.5
   done
-  insmod "$KO" || { log "insmod failed"; return 1; }
+  if ! insmod "$KO"; then
+    log "insmod failed — loading the stock btusb back so Bluetooth is not left without a driver"
+    modprobe btusb || true
+    return 1
+  fi
   log "patched btusb loaded"
   systemctl try-restart bluetooth.service || true
 }
